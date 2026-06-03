@@ -3,6 +3,7 @@ import os
 import time
 import cv2
 import numpy as np
+import re
 import traceback
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,47 +28,44 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Custom Gap Measurement (The "11" Splicer)
+# Custom Gap Measurement (The "11" Splicer) — LEGACY PATH ONLY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def remove_massive_gaps(binary_img, max_allowed_gap):
     """
-    Scans the image column by column to MEASURE THE WIDTH of the empty gaps.
-    If a gap is wider than 'max_allowed_gap', it cuts out the excess pixels.
-    This safely pulls isolated numbers together without squishing them into a '4'.
+    Scans column by column and caps empty gaps at 'max_allowed_gap'.
+    NOTE: only used by the legacy CRAFT path.
     """
-    # Invert so text is >0
     inv = cv2.bitwise_not(binary_img)
     col_sums = np.sum(inv, axis=0)
     has_text = col_sums > 0
-    
+
     new_cols = []
     current_gap = 0
-    
+
     for x in range(binary_img.shape[1]):
         if has_text[x]:
             if current_gap > 0:
-                # Add the empty space back, but CAP IT at max_allowed_gap
                 gap_to_add = min(current_gap, max_allowed_gap)
                 for _ in range(gap_to_add):
                     new_cols.append(np.full(binary_img.shape[0], 255, dtype=np.uint8))
-            
             current_gap = 0
             new_cols.append(binary_img[:, x])
         else:
             current_gap += 1
-            
+
     if len(new_cols) == 0:
         return binary_img
-        
+
     return np.column_stack(new_cols)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing
+# Shared preprocessing — WITH DECIMAL PROTECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morph_iters: int, gap_limit: int) -> np.ndarray:
+def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int,
+                   morph_iters: int, gap_limit: int, do_splice: bool = True) -> np.ndarray:
     h, w = frame_bgr.shape[:2]
 
     # ── 1. ROI crop ──────────────────────────────────────────────────────────
@@ -99,21 +97,192 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morp
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
-    # ── 6. PIXEL GAP SPLICING (Your Logic) ───────────────────────────────────
-    binary = remove_massive_gaps(binary, max_allowed_gap=gap_limit)
+    # ── 6. PIXEL GAP SPLICING (legacy CRAFT path only) ───────────────────────
+    if do_splice:
+        binary = remove_massive_gaps(binary, max_allowed_gap=gap_limit)
 
-    # ── 7. Morphological Closing ─────────────────────────────────────────────
+    # ── 7. DECIMAL-PROTECTED MORPHOLOGY ──────────────────────────────────────
     if morph_iters > 0:
         binary_inverted = cv2.bitwise_not(binary)
+        
+        # A. Find all connected shapes on the screen
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(binary_inverted, connectivity=8)
+        
+        digits_mask = np.zeros_like(binary_inverted)
+        dots_mask = np.zeros_like(binary_inverted)
+        
+        H_img = binary_inverted.shape[0]
+        # Find the height of the tallest thing on screen (usually a number)
+        max_h = max([stats[i, cv2.CC_STAT_HEIGHT] for i in range(1, num)] + [1])
+        
+        for i in range(1, num):
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+            aa = int(stats[i, cv2.CC_STAT_AREA])
+            
+            # B. Isolate the Decimal Point
+            # If the shape is tiny (< 35% height) and sits in the bottom half of the image...
+            if hh <= 0.35 * max_h and aa >= 4 and (y + hh) > 0.55 * H_img:
+                dots_mask[labels == i] = 255  # Save it to the protected dots layer
+            else:
+                digits_mask[labels == i] = 255 # Keep it in the numbers layer
+                
+        # C. Run aggressive Closing ONLY on the big numbers
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed = cv2.morphologyEx(binary_inverted, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
-        binary = cv2.bitwise_not(closed)
+        closed_digits = cv2.morphologyEx(digits_mask, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
+        
+        # D. Combine the closed numbers with the perfectly protected decimal point
+        recombined = cv2.bitwise_or(closed_digits, dots_mask)
+        binary = cv2.bitwise_not(recombined)
 
     # ── 8. Pad & Final Anti-Aliasing ─────────────────────────────────────────
     padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
     final_ready = cv2.GaussianBlur(padded, (3, 3), 0)
 
     return final_ready
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-digit segmentation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def segment_digits(binary,
+                   min_h_frac: float = 0.40,
+                   dot_h_range=(0.05, 0.35),
+                   split_ratio: float = 1.5,
+                   min_dot_area: int = 6):
+    
+    text = cv2.bitwise_not(binary)                      
+    _, text = cv2.threshold(text, 127, 255, cv2.THRESH_BINARY)
+
+    num, _labels, stats, _cent = cv2.connectedComponentsWithStats(text, connectivity=8)
+    if num <= 1:
+        return [], []
+
+    raw = []
+    for i in range(1, num):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        ww = int(stats[i, cv2.CC_STAT_WIDTH])
+        hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        aa = int(stats[i, cv2.CC_STAT_AREA])
+        raw.append((x, y, ww, hh, aa))
+
+    max_h = max(c[3] for c in raw)
+    H = binary.shape[0]
+
+    digits, dots = [], []
+    for (x, y, ww, hh, aa) in raw:
+        if hh >= min_h_frac * max_h:
+            digits.append([x, y, ww, hh])
+        elif (dot_h_range[0] * max_h <= hh <= dot_h_range[1] * max_h
+              and aa >= min_dot_area and (y + hh) > 0.55 * H):
+            dots.append([x, y, ww, hh])
+
+    dot_boxes = [[x, x + ww, y, y + hh] for (x, y, ww, hh) in dots]
+
+    if not digits:
+        return [], dot_boxes
+
+    digits.sort(key=lambda c: c[0])
+
+    widths = sorted(c[2] for c in digits)
+    med = widths[len(widths) // 2]
+
+    split = []
+    for (x, y, ww, hh) in digits:
+        if med <= 0 or ww <= split_ratio * med:
+            split.append([x, y, ww, hh])
+            continue
+
+        sub = text[y:y + hh, x:x + ww]
+        cuts = _gap_cuts(sub, min_sub=max(3, int(0.45 * med)))
+
+        if cuts:
+            prev = 0
+            for c in list(cuts) + [ww]:
+                if c - prev > 0:
+                    split.append([x + prev, y, c - prev, hh])
+                prev = c
+        elif ww >= 1.9 * med and len(digits) >= 3:
+            n = max(2, int(round(ww / med)))
+            sw = ww / n
+            for k in range(n):
+                split.append([int(x + k * sw), y, int(round(sw)), hh])
+        else:
+            split.append([x, y, ww, hh])
+
+    digit_boxes = [[x, x + ww, y, y + hh] for (x, y, ww, hh) in split]
+    return digit_boxes, dot_boxes
+
+
+def _gap_cuts(text_mask, min_sub: int, gap_frac: float = 0.06):
+    h, w = text_mask.shape[:2]
+    if w == 0 or h == 0:
+        return []
+    col_ink = (text_mask > 0).sum(axis=0).astype(float)
+    thr = max(2.0, gap_frac * h)
+
+    cuts = []
+    last = 0
+    i = min_sub
+    while i < w - min_sub:
+        if col_ink[i] <= thr:
+            j = i
+            while j < w and col_ink[j] <= thr:
+                j += 1
+            center = (i + j) // 2
+            if center - last >= min_sub and (w - center) >= min_sub:
+                cuts.append(center)
+                last = center
+            i = j
+        else:
+            i += 1
+    return cuts
+
+
+def annotate_segmentation(binary, digit_boxes, dot_boxes):
+    vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    for (x0, x1, y0, y1) in digit_boxes:
+        cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 170, 0), 2)
+    for (x0, x1, y0, y1) in dot_boxes:
+        cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 0, 220), 2)
+    return vis
+
+
+def pad_digit_boxes(boxes, W, H, pad_x: float = 0.30, pad_y: float = 0.30,
+                    gap_frac: float = 0.45, min_aspect_ratio: float = 0.60):
+    boxes = sorted(boxes, key=lambda b: b[0])
+    n = len(boxes)
+    out = []
+    
+    for i, (x0, x1, y0, y1) in enumerate(boxes):
+        bw, bh = x1 - x0, y1 - y0
+        
+        px = int(round(bw * pad_x))
+        py = int(round(bh * pad_y))
+
+        target_w = max(bw, int(bh * min_aspect_ratio))
+        extra_w = max(0, target_w - bw)
+        
+        px_req_left = px + (extra_w // 2)
+        px_req_right = px + (extra_w - (extra_w // 2))
+
+        if i > 0:
+            left_gap = x0 - boxes[i - 1][1]
+            px_left = min(px_req_left, max(0, int(left_gap * gap_frac)))
+        else:
+            px_left = px_req_left
+            
+        if i < n - 1:
+            right_gap = boxes[i + 1][0] - x1
+            px_right = min(px_req_right, max(0, int(right_gap * gap_frac)))
+        else:
+            px_right = px_req_right
+
+        out.append([max(0, x0 - px_left), min(W, x1 + px_right),
+                    max(0, y0 - py), min(H, y1 + py)])
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,15 +294,18 @@ class OCRWorker(QThread):
 
     def __init__(self):
         super().__init__()
-        self.reader = easyocr.Reader(['en']) 
-        
+        self.reader = easyocr.Reader(['en'])
+
         self.frame  = None
         self.roi    = None
         self.config = {}
         self._busy  = False
 
+        self._last_mode   = 'perdigit'
         self._last_raw    = None
         self._last_binary = None
+        self._last_text   = None
+        self._last_vis    = None
 
     def update_task(self, frame, roi, config):
         if self._busy:
@@ -145,6 +317,11 @@ class OCRWorker(QThread):
         self.start()
 
     def refilter(self, confidence: float):
+        if self._last_mode == 'perdigit':
+            if self._last_text is not None and self._last_vis is not None:
+                self.result_ready.emit(self._last_text, 0.0, self._last_vis.copy())
+            return
+
         if self._last_raw is None or self._last_binary is None:
             return
         lines = self._parse_result(self._last_raw, confidence)
@@ -157,36 +334,11 @@ class OCRWorker(QThread):
             return
         try:
             start_time = time.time()
-
-            binary = compute_binary(
-                self.frame,
-                self.roi,
-                self.config.get('use_otsu', True),
-                self.config.get('manual_thresh', 127),
-                self.config.get('morph_iters', 0),
-                self.config.get('gap_limit', 50)
-            )
-
-            ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-            
-            raw = self.reader.readtext(
-                ocr_input, 
-                allowlist='0123456789.', 
-                width_ths=2.0,       
-                text_threshold=0.1,  
-                low_text=0.1         
-            )
-
-            self._last_raw    = raw
-            self._last_binary = binary.copy()
-
-            conf  = self.config.get('confidence', 0.15)
-            lines = self._parse_result(raw, conf)
-            text  = "\n".join(lines) if lines else "No text detected."
-            elapsed_ms = (time.time() - start_time) * 1000
-
-            self.result_ready.emit(text, elapsed_ms, binary.copy())
-
+            if self.config.get('per_digit', True):
+                self._run_per_digit()
+            else:
+                self._run_legacy()
+            _ = start_time
         except Exception:
             tb = traceback.format_exc()
             print("OCR Worker Error:\n", tb)
@@ -195,35 +347,193 @@ class OCRWorker(QThread):
         finally:
             self._busy = False
 
+    # ── Per-digit pipeline ───────────────────────────────────────────────────
+    def _run_per_digit(self):
+        start_time = time.time()
+
+        binary = compute_binary(
+            self.frame, self.roi,
+            self.config.get('use_otsu', True),
+            self.config.get('manual_thresh', 127),
+            self.config.get('morph_iters', 0),
+            self.config.get('gap_limit', 50),
+            do_splice=False,
+        )
+        H, W = binary.shape
+        pad = self.config.get('pad_pct', 30) / 100.0
+
+        digit_boxes, dot_boxes = segment_digits(binary)
+        padded = pad_digit_boxes(digit_boxes, W, H, pad_x=pad, pad_y=pad)
+
+        vis = annotate_segmentation(binary, padded, dot_boxes)
+        self._last_mode   = 'perdigit'
+        self._last_binary = binary.copy()
+        self._last_vis    = vis.copy()
+
+        if not digit_boxes:
+            self._last_text = "No digits detected."
+            self.result_ready.emit(self._last_text, 0.0, vis)
+            return
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        thick  = cv2.erode(binary, kernel, iterations=1)
+
+        tokens = []
+        confs  = []
+        empties = 0
+        for box, pbox in zip(sorted(digit_boxes, key=lambda b: b[0]), padded):
+            ch, conf = self._read_digit_vote(binary, thick, pbox)
+            if ch == '':
+                empties += 1
+                continue
+            confs.append(conf)
+            tokens.append(((box[0] + box[1]) / 2.0, ch))
+
+        dot_x = self._select_decimal(dot_boxes, digit_boxes)
+        if dot_x is not None:
+            tokens.append((dot_x, '.'))
+
+        tokens.sort(key=lambda t: t[0])
+        number = self._finalize_number(tokens)
+
+        mean_conf = (sum(confs) / len(confs)) if confs else 0.0
+        low = empties > 0 or (confs and min(confs) < 0.30)
+        flag = "   (low-confidence)" if low else ""
+
+        elapsed_ms = (time.time() - start_time) * 1000.0
+        if number == '':
+            self._last_text = "No valid number." + flag
+        else:
+            self._last_text = f"{number}   [{mean_conf:.2f}]{flag}"
+        self.result_ready.emit(self._last_text, elapsed_ms, vis)
+
+    def _read_digit_vote(self, binary, thick, box):
+        best_txt, best_conf = '', 0.0
+        for img in (binary, thick):
+            res = self.reader.recognize(
+                img, horizontal_list=[box], free_list=[],
+                allowlist='0123456789', detail=1, paragraph=False,
+                decoder='beamsearch', beamWidth=10 
+            )
+            if res:
+                t = ''.join(c for c in str(res[0][1]) if c.isdigit())
+                c = float(res[0][2])
+                if t and c > best_conf:
+                    best_txt, best_conf = t[0], c
+        return best_txt, best_conf
+
+    @staticmethod
+    def _select_decimal(dot_boxes, digit_boxes):
+        if not dot_boxes or not digit_boxes:
+            return None
+        first_x = min(b[0] for b in digit_boxes)
+        last_x  = max(b[1] for b in digit_boxes)
+        best_x, best_area = None, -1
+        for (x0, x1, y0, y1) in dot_boxes:
+            cx = (x0 + x1) / 2.0
+            if first_x < cx < last_x:
+                area = (x1 - x0) * (y1 - y0)
+                if area > best_area:
+                    best_x, best_area = cx, area
+        return best_x
+
+    @staticmethod
+    def _finalize_number(tokens):
+        s = ''.join(ch for _, ch in tokens)
+        s = re.sub(r'[^0-9.]', '', s)
+        if s.count('.') > 1:
+            i = s.index('.')
+            s = s[:i + 1] + s[i + 1:].replace('.', '')
+        return s
+
+    # ── Legacy CRAFT pipeline ───────────────────────
+    def _run_legacy(self):
+        start_time = time.time()
+
+        binary = compute_binary(
+            self.frame, self.roi,
+            self.config.get('use_otsu', True),
+            self.config.get('manual_thresh', 127),
+            self.config.get('morph_iters', 0),
+            self.config.get('gap_limit', 50),
+            do_splice=True,
+        )
+
+        ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        raw = self.reader.readtext(
+            ocr_input,
+            allowlist='0123456789.',
+            width_ths=0.0,
+            link_threshold=0.9,
+            mag_ratio=1.5,
+            text_threshold=0.1,
+            low_text=0.1,
+            decoder='beamsearch',
+            beamWidth=10
+        )
+
+        self._last_mode   = 'legacy'
+        self._last_raw    = raw
+        self._last_binary = binary.copy()
+
+        conf  = self.config.get('confidence', 0.15)
+        lines = self._parse_result(raw, conf)
+        text  = "\n".join(lines) if lines else "No text detected."
+        elapsed_ms = (time.time() - start_time) * 1000.0
+        self.result_ready.emit(text, elapsed_ms, binary.copy())
+
     @staticmethod
     def _parse_result(result, confidence: float = 0.15) -> list:
         if not result:
             return []
-        
+
         valid_items = []
         for item in result:
             try:
                 text  = str(item[1]).replace(" ", "")
                 score = float(item[2])
-                x_pos = float(item[0][0][0]) 
-                
+                x_pos = float(item[0][0][0])
+                x_max = max([pt[0] for pt in item[0]])
+
                 if text and score >= confidence:
-                    valid_items.append((x_pos, text, score))
+                    valid_items.append({
+                        'text': text,
+                        'score': score,
+                        'x_min': x_pos,
+                        'x_max': x_max
+                    })
             except (IndexError, TypeError, ValueError):
                 continue
-                
+
         if not valid_items:
             return []
-            
-        valid_items.sort(key=lambda x: x[0])
-        combined_text = "".join([i[1] for i in valid_items])
-        
-        if len(valid_items) > 0:
-            avg_score = sum([i[2] for i in valid_items]) / len(valid_items)
-        else:
-            avg_score = 0.0
-            
-        return [f"{combined_text}   [{avg_score:.2f}]"]
+
+        valid_items.sort(key=lambda x: x['x_min'])
+
+        grouped_results = []
+        current_text = valid_items[0]['text']
+        current_scores = [valid_items[0]['score']]
+        last_x_max = valid_items[0]['x_max']
+
+        for i in range(1, len(valid_items)):
+            item = valid_items[i]
+            distance = item['x_min'] - last_x_max
+
+            if distance < 300:
+                current_text += item['text']
+                current_scores.append(item['score'])
+            else:
+                avg_score = sum(current_scores) / len(current_scores)
+                grouped_results.append(f"{current_text}   [{avg_score:.2f}]")
+                current_text = item['text']
+                current_scores = [item['score']]
+
+            last_x_max = item['x_max']
+
+        avg_score = sum(current_scores) / len(current_scores)
+        grouped_results.append(f"{current_text}   [{avg_score:.2f}]")
+
+        return grouped_results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,8 +652,8 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — Custom Gap Splicing")
-        self.setGeometry(100, 100, 1260, 950)
+        self.setWindowTitle("OCR Pipeline — Decimal Protection Edition")
+        self.setGeometry(100, 100, 1260, 980)
 
         self.current_frame   = None
         self.selected_roi    = None
@@ -379,7 +689,7 @@ class MainWindow(QMainWindow):
 
         thumb_row = QHBoxLayout()
         thumb_col = QVBoxLayout()
-        thumb_col.addWidget(QLabel("Preprocessed (what OCR sees):"))
+        thumb_col.addWidget(QLabel("Preprocessed + segmentation (what OCR sees):"))
         self.view_preprocessed = QLabel()
         self.view_preprocessed.setFixedSize(320, 240)
         self.view_preprocessed.setStyleSheet("background-color: #222; color: #aaa;")
@@ -404,6 +714,39 @@ class MainWindow(QMainWindow):
         group_media.setLayout(mf)
         right_layout.addWidget(group_media)
 
+        # Recognition mode
+        group_mode = QGroupBox("Recognition Mode")
+        mode_layout = QVBoxLayout()
+        self.chk_perdigit = QCheckBox("Per-Digit Segmentation (fixes repeated zeros)")
+        self.chk_perdigit.setChecked(True)
+        self.chk_perdigit.stateChanged.connect(self._refresh_preview_and_queue_ocr)
+        mode_layout.addWidget(self.chk_perdigit)
+        mode_hint = QLabel("ON: connected-component segmentation, one digit per inference. "
+                           "OFF: legacy CRAFT path.")
+        mode_hint.setStyleSheet("color: gray; font-size: 11px;")
+        mode_hint.setWordWrap(True)
+        mode_layout.addWidget(mode_hint)
+
+        pad_row = QHBoxLayout()
+        pad_row.addWidget(QLabel("Box Padding %:"))
+        self.slider_pad = QSlider(Qt.Horizontal)
+        self.slider_pad.setRange(0, 60)
+        self.slider_pad.setValue(30)
+        self.slider_pad.setTickInterval(10)
+        self.slider_pad.setTickPosition(QSlider.TicksBelow)
+        self.slider_pad.valueChanged.connect(self._on_pad_changed)
+        pad_row.addWidget(self.slider_pad)
+        self.lbl_pad_val = QLabel("30")
+        self.lbl_pad_val.setFixedWidth(30)
+        pad_row.addWidget(self.lbl_pad_val)
+        mode_layout.addLayout(pad_row)
+        pad_hint = QLabel("Enforces a minimum aspect ratio so '7' doesn't look like '1'.")
+        pad_hint.setStyleSheet("color: gray; font-size: 11px;")
+        pad_hint.setWordWrap(True)
+        mode_layout.addWidget(pad_hint)
+        group_mode.setLayout(mode_layout)
+        right_layout.addWidget(group_mode)
+
         # Binarization
         group_pre = QGroupBox("Binarization")
         pre_layout = QVBoxLayout()
@@ -425,19 +768,19 @@ class MainWindow(QMainWindow):
         self.lbl_thresh_val.setFixedWidth(30)
         thresh_row.addWidget(self.lbl_thresh_val)
         pre_layout.addLayout(thresh_row)
-        
+
         group_pre.setLayout(pre_layout)
         right_layout.addWidget(group_pre)
 
-        # The "11" Fix Splicer Box
-        group_splicer = QGroupBox("Gap Splicing (The '11' Fix)")
+        # Gap Splicer (legacy path only)
+        group_splicer = QGroupBox("Gap Splicing (legacy CRAFT path only)")
         splicer_layout = QVBoxLayout()
-        
+
         gap_row = QHBoxLayout()
         gap_row.addWidget(QLabel("Max Gap Limit:"))
         self.slider_gap = QSlider(Qt.Horizontal)
         self.slider_gap.setRange(10, 100)
-        self.slider_gap.setValue(50)  # Safe default to prevent 11s from squishing
+        self.slider_gap.setValue(50)
         self.slider_gap.setTickInterval(10)
         self.slider_gap.setTickPosition(QSlider.TicksBelow)
         self.slider_gap.valueChanged.connect(self._on_gap_changed)
@@ -446,18 +789,18 @@ class MainWindow(QMainWindow):
         self.lbl_gap_val.setFixedWidth(30)
         gap_row.addWidget(self.lbl_gap_val)
         splicer_layout.addLayout(gap_row)
-        
-        gap_hint = QLabel("If '1' vanishes: LOWER limit. If '11' becomes '4': INCREASE limit.")
-        gap_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
+
+        gap_hint = QLabel("Ignored in Per-Digit mode. It only affects the legacy path.")
+        gap_hint.setStyleSheet("color: gray; font-size: 11px;")
         splicer_layout.addWidget(gap_hint)
-        
+
         group_splicer.setLayout(splicer_layout)
         right_layout.addWidget(group_splicer)
 
         # Morphology
-        group_morph = QGroupBox("Morphology (Optional)")
+        group_morph = QGroupBox("Morphology (Now with Decimal Protection!)")
         morph_layout = QVBoxLayout()
-        
+
         morph_row = QHBoxLayout()
         morph_row.addWidget(QLabel("Closing Amount:"))
         self.slider_morph = QSlider(Qt.Horizontal)
@@ -472,11 +815,15 @@ class MainWindow(QMainWindow):
         morph_row.addWidget(self.lbl_morph_val)
         morph_layout.addLayout(morph_row)
         
+        morph_hint = QLabel("Safe to increase. Decimal points are now mathematically protected from melting.")
+        morph_hint.setStyleSheet("color: #008800; font-size: 11px; font-weight: bold;")
+        morph_layout.addWidget(morph_hint)
+
         group_morph.setLayout(morph_layout)
         right_layout.addWidget(group_morph)
 
         # Confidence Filter
-        group_conf = QGroupBox("OCR Confidence Filter")
+        group_conf = QGroupBox("OCR Confidence Filter (legacy path)")
         conf_layout = QVBoxLayout()
 
         self.lbl_conf = QLabel("Min Confidence: 0.15")
@@ -494,6 +841,10 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(self.conf_slider)
         conf_row.addWidget(QLabel("1.00"))
         conf_layout.addLayout(conf_row)
+
+        conf_hint = QLabel("Per-Digit mode never drops digits, so this is a display value there.")
+        conf_hint.setStyleSheet("color: gray; font-size: 11px;")
+        conf_layout.addWidget(conf_hint)
 
         group_conf.setLayout(conf_layout)
         right_layout.addWidget(group_conf)
@@ -552,23 +903,36 @@ class MainWindow(QMainWindow):
     def _on_morph_changed(self, value):
         self.lbl_morph_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
-        
+
     def _on_gap_changed(self, value):
         self.lbl_gap_val.setText(str(value))
+        self._refresh_preview_and_queue_ocr()
+
+    def _on_pad_changed(self, value):
+        self.lbl_pad_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
 
     def _refresh_preview_and_queue_ocr(self):
         if self.current_frame is None:
             return
+        per_digit = self.chk_perdigit.isChecked()
         binary = compute_binary(
             self.current_frame,
             self.selected_roi,
             self.chk_otsu.isChecked(),
             self.slider_thresh.value(),
             self.slider_morph.value(),
-            self.slider_gap.value()
+            self.slider_gap.value(),
+            do_splice=not per_digit,
         )
-        self._show_preview(binary)
+        if per_digit:
+            dboxes, dotboxes = segment_digits(binary)
+            ph, pw = binary.shape
+            p = self.slider_pad.value() / 100.0
+            pboxes = pad_digit_boxes(dboxes, pw, ph, pad_x=p, pad_y=p)
+            self._show_preview(annotate_segmentation(binary, pboxes, dotboxes))
+        else:
+            self._show_preview(binary)
         self._ocr_debounce.start()
 
     def _on_confidence_changed(self, value):
@@ -633,6 +997,8 @@ class MainWindow(QMainWindow):
             self.current_frame,
             self.selected_roi,
             {
+                'per_digit':      self.chk_perdigit.isChecked(),
+                'pad_pct':        self.slider_pad.value(),
                 'use_otsu':       self.chk_otsu.isChecked(),
                 'manual_thresh':  self.slider_thresh.value(),
                 'morph_iters':    self.slider_morph.value(),
@@ -657,9 +1023,14 @@ class MainWindow(QMainWindow):
         self.text_output.setPlainText(text)
         self._show_preview(debug_img)
 
-    def _show_preview(self, binary: np.ndarray):
-        h, w = binary.shape
-        q_img = QImage(bytes(binary.data), w, h, w, QImage.Format_Grayscale8)
+    def _show_preview(self, img: np.ndarray):
+        if img.ndim == 2:
+            h, w = img.shape
+            q_img = QImage(bytes(img.data), w, h, w, QImage.Format_Grayscale8)
+        else:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            q_img = QImage(bytes(rgb.data), w, h, ch * w, QImage.Format_RGB888)
         self.view_preprocessed.setPixmap(
             QPixmap.fromImage(q_img).scaled(
                 320, 240, Qt.KeepAspectRatio, Qt.SmoothTransformation))
