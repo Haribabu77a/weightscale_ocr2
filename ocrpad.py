@@ -27,12 +27,12 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing — used by BOTH the OCR worker and the live preview.
+# Shared preprocessing — Upscale, Blur, and Adjustable Dilation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int) -> np.ndarray:
+def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, dilation_iters: int) -> np.ndarray:
     """
-    Crop → grayscale → binarize → auto-invert.
+    Crop → Upscale → Grayscale → Blur → Binarize → Dilate → Pad → Auto-invert.
     Returns a uint8 grayscale image with DARK TEXT ON WHITE BACKGROUND.
     """
     h, w = frame_bgr.shape[:2]
@@ -49,21 +49,38 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int) -> n
     else:
         region = frame_bgr
 
-    # ── 2. Grayscale ─────────────────────────────────────────────────────────
+    # ── 2. Upscale (Zoom) ────────────────────────────────────────────────────
+    region = cv2.resize(region, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+
+    # ── 3. Grayscale ─────────────────────────────────────────────────────────
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
-    # ── 3. Binarize ──────────────────────────────────────────────────────────
-    if use_otsu:
-        _, binary = cv2.threshold(gray, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    else:
-        _, binary = cv2.threshold(gray, manual_thresh, 255, cv2.THRESH_BINARY)
+    # ── 4. Gaussian Blur ─────────────────────────────────────────────────────
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # ── 4. Auto-invert so text is always dark on white ───────────────────────
+    # ── 5. Binarize ──────────────────────────────────────────────────────────
+    if use_otsu:
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        _, binary = cv2.threshold(blurred, manual_thresh, 255, cv2.THRESH_BINARY)
+
+    # ── 6. Ensure Dark Text on White Background initially ────────────────────
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
-    return binary
+    # ── 7. Adjustable Dilation (Thicken Text) ────────────────────────────────
+    if dilation_iters > 0:
+        # Dilation expands WHITE pixels. Since our text is black on white, 
+        # we invert it, expand the white text, and invert it back.
+        binary_inverted = cv2.bitwise_not(binary)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        thickened = cv2.dilate(binary_inverted, kernel, iterations=dilation_iters)
+        binary = cv2.bitwise_not(thickened)
+
+    # ── 8. Add Padding (Fix edge starvation) ─────────────────────────────────
+    padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
+
+    return padded
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,14 +131,13 @@ class OCRWorker(QThread):
                 self.roi,
                 self.config.get('use_otsu', True),
                 self.config.get('manual_thresh', 127),
+                self.config.get('dilation_iters', 0)
             )
 
             ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
             
-            # ─────────────────────────────────────────────────────────────────
-            # MAGIC HAPPENS HERE: The allowlist forces output to only be numbers
-            # ─────────────────────────────────────────────────────────────────
-            raw = self.reader.readtext(ocr_input, allowlist='0123456789')
+            # Allowlist forces output to only be numbers and decimal point
+            raw = self.reader.readtext(ocr_input, allowlist='0123456789.')
 
             self._last_raw    = raw
             self._last_binary = binary.copy()
@@ -148,7 +164,7 @@ class OCRWorker(QThread):
         lines = []
         for item in result:
             try:
-                # Text is already forced to numbers by allowlist, just clean any weird spaces
+                # Strip spaces that OCR might accidentally inject between thick numbers
                 text  = str(item[1]).replace(" ", "")
                 score = float(item[2])
                 if text and score >= confidence:
@@ -274,8 +290,8 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — EasyOCR (Numbers Only)")
-        self.setGeometry(100, 100, 1260, 900)
+        self.setWindowTitle("OCR Pipeline — EasyOCR (Adjustable Dilation)")
+        self.setGeometry(100, 100, 1260, 920)
 
         self.current_frame   = None
         self.selected_roi    = None
@@ -322,6 +338,7 @@ class MainWindow(QMainWindow):
         thumb_row.addStretch()
         left_layout.addLayout(thumb_row)
 
+        # ── Input Source ──
         group_media = QGroupBox("Input Source")
         mf = QFormLayout()
         self.combo_source = QComboBox()
@@ -336,6 +353,7 @@ class MainWindow(QMainWindow):
         group_media.setLayout(mf)
         right_layout.addWidget(group_media)
 
+        # ── Binarization ──
         group_pre = QGroupBox("Binarization")
         pre_layout = QVBoxLayout()
 
@@ -356,10 +374,36 @@ class MainWindow(QMainWindow):
         self.lbl_thresh_val.setFixedWidth(30)
         thresh_row.addWidget(self.lbl_thresh_val)
         pre_layout.addLayout(thresh_row)
-
+        
         group_pre.setLayout(pre_layout)
         right_layout.addWidget(group_pre)
 
+        # ── Morphology / Dilation ──
+        group_morph = QGroupBox("Morphology (Thickness)")
+        morph_layout = QVBoxLayout()
+        
+        morph_row = QHBoxLayout()
+        morph_row.addWidget(QLabel("Dilation Amount:"))
+        self.slider_dilation = QSlider(Qt.Horizontal)
+        self.slider_dilation.setRange(0, 10)
+        self.slider_dilation.setValue(0)
+        self.slider_dilation.setTickInterval(1)
+        self.slider_dilation.setTickPosition(QSlider.TicksBelow)
+        self.slider_dilation.valueChanged.connect(self._on_dilation_changed)
+        morph_row.addWidget(self.slider_dilation)
+        self.lbl_dilation_val = QLabel("0")
+        self.lbl_dilation_val.setFixedWidth(30)
+        morph_row.addWidget(self.lbl_dilation_val)
+        morph_layout.addLayout(morph_row)
+        
+        morph_hint = QLabel("Closes gaps in 7-segment numbers. (0 = Disabled, 1-3 = Recommended)")
+        morph_hint.setStyleSheet("color: gray; font-size: 11px;")
+        morph_layout.addWidget(morph_hint)
+        
+        group_morph.setLayout(morph_layout)
+        right_layout.addWidget(group_morph)
+
+        # ── Confidence ──
         group_conf = QGroupBox("OCR Confidence Filter")
         conf_layout = QVBoxLayout()
 
@@ -379,14 +423,14 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("1.00"))
         conf_layout.addLayout(conf_row)
 
-        conf_hint = QLabel("Drag left → show more results (lower confidence accepted)\n"
-                           "Drag right → show only high-confidence results")
+        conf_hint = QLabel("Drag left → show more results (lower confidence accepted)")
         conf_hint.setStyleSheet("color: gray; font-size: 11px;")
         conf_layout.addWidget(conf_hint)
 
         group_conf.setLayout(conf_layout)
         right_layout.addWidget(group_conf)
 
+        # ── Execution Controls ──
         group_actions = QGroupBox("Execution Controls")
         act = QVBoxLayout()
 
@@ -437,6 +481,10 @@ class MainWindow(QMainWindow):
         self.lbl_thresh_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
 
+    def _on_dilation_changed(self, value):
+        self.lbl_dilation_val.setText(str(value))
+        self._refresh_preview_and_queue_ocr()
+
     def _refresh_preview_and_queue_ocr(self):
         if self.current_frame is None:
             return
@@ -445,6 +493,7 @@ class MainWindow(QMainWindow):
             self.selected_roi,
             self.chk_otsu.isChecked(),
             self.slider_thresh.value(),
+            self.slider_dilation.value()
         )
         self._show_preview(binary)
         self._ocr_debounce.start()
@@ -511,9 +560,10 @@ class MainWindow(QMainWindow):
             self.current_frame,
             self.selected_roi,
             {
-                'use_otsu':      self.chk_otsu.isChecked(),
-                'manual_thresh': self.slider_thresh.value(),
-                'confidence':    self.conf_slider.value() / 100.0,
+                'use_otsu':       self.chk_otsu.isChecked(),
+                'manual_thresh':  self.slider_thresh.value(),
+                'dilation_iters': self.slider_dilation.value(),
+                'confidence':     self.conf_slider.value() / 100.0,
             }
         )
 
