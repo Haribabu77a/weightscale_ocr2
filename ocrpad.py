@@ -27,13 +27,12 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing — Upscale, Blur, and Adjustable Dilation
+# Shared preprocessing — Horizontal Stretch + Morphological Closing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, dilation_iters: int) -> np.ndarray:
+def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morph_iters: int) -> np.ndarray:
     """
-    Crop → Upscale → Grayscale → Blur → Binarize → Dilate → Pad → Auto-invert.
-    Returns a uint8 grayscale image with DARK TEXT ON WHITE BACKGROUND.
+    Crop → Stretch Width → Grayscale → Blur → Binarize → Morph Close → Pad → Invert.
     """
     h, w = frame_bgr.shape[:2]
 
@@ -49,8 +48,10 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, dila
     else:
         region = frame_bgr
 
-    # ── 2. Upscale (Zoom) ────────────────────────────────────────────────────
-    region = cv2.resize(region, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    # ── 2. Horizontal Stretch (Zoom) ─────────────────────────────────────────
+    # MAGIC HAPPENS HERE: We stretch the width by 3.5x and height by 2.5x.
+    # This turns a thin, invisible "1" into a thick, obvious character block.
+    region = cv2.resize(region, None, fx=3.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
 
     # ── 3. Grayscale ─────────────────────────────────────────────────────────
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
@@ -68,16 +69,16 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, dila
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
-    # ── 7. Adjustable Dilation (Thicken Text) ────────────────────────────────
-    if dilation_iters > 0:
-        # Dilation expands WHITE pixels. Since our text is black on white, 
-        # we invert it, expand the white text, and invert it back.
+    # ── 7. Morphological Closing (Bridge gaps, preserve decimals) ────────────
+    if morph_iters > 0:
         binary_inverted = cv2.bitwise_not(binary)
+        # We use a 3x3 kernel. MORPH_CLOSE fills in small holes/gaps without 
+        # expanding the outer boundaries of the text like dilation does.
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        thickened = cv2.dilate(binary_inverted, kernel, iterations=dilation_iters)
-        binary = cv2.bitwise_not(thickened)
+        closed = cv2.morphologyEx(binary_inverted, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
+        binary = cv2.bitwise_not(closed)
 
-    # ── 8. Add Padding (Fix edge starvation) ─────────────────────────────────
+    # ── 8. Add Padding ───────────────────────────────────────────────────────
     padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
 
     return padded
@@ -88,7 +89,6 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, dila
 # ─────────────────────────────────────────────────────────────────────────────
 
 class OCRWorker(QThread):
-    """Runs EasyOCR inference in a background thread."""
     result_ready = pyqtSignal(str, float, np.ndarray)
 
     def __init__(self):
@@ -131,18 +131,17 @@ class OCRWorker(QThread):
                 self.roi,
                 self.config.get('use_otsu', True),
                 self.config.get('manual_thresh', 127),
-                self.config.get('dilation_iters', 0)
+                self.config.get('morph_iters', 0)
             )
 
             ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
             
-            # Allowlist forces output to only be numbers and decimal point
             raw = self.reader.readtext(ocr_input, allowlist='0123456789.')
 
             self._last_raw    = raw
             self._last_binary = binary.copy()
 
-            conf  = self.config.get('confidence', 0.30)
+            conf  = self.config.get('confidence', 0.20) # Default internally
             lines = self._parse_result(raw, conf)
             text  = "\n".join(lines) if lines else "No text detected."
             elapsed_ms = (time.time() - start_time) * 1000
@@ -158,13 +157,13 @@ class OCRWorker(QThread):
             self._busy = False
 
     @staticmethod
-    def _parse_result(result, confidence: float = 0.30) -> list:
+    def _parse_result(result, confidence: float = 0.20) -> list:
         if not result:
             return []
         lines = []
         for item in result:
             try:
-                # Strip spaces that OCR might accidentally inject between thick numbers
+                # Strip weird spaces, leave numbers and dots
                 text  = str(item[1]).replace(" ", "")
                 score = float(item[2])
                 if text and score >= confidence:
@@ -290,7 +289,7 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — EasyOCR (Adjustable Dilation)")
+        self.setWindowTitle("OCR Pipeline — EasyOCR (Horizontal Stretch Fix)")
         self.setGeometry(100, 100, 1260, 920)
 
         self.current_frame   = None
@@ -338,7 +337,6 @@ class MainWindow(QMainWindow):
         thumb_row.addStretch()
         left_layout.addLayout(thumb_row)
 
-        # ── Input Source ──
         group_media = QGroupBox("Input Source")
         mf = QFormLayout()
         self.combo_source = QComboBox()
@@ -353,7 +351,6 @@ class MainWindow(QMainWindow):
         group_media.setLayout(mf)
         right_layout.addWidget(group_media)
 
-        # ── Binarization ──
         group_pre = QGroupBox("Binarization")
         pre_layout = QVBoxLayout()
 
@@ -378,36 +375,34 @@ class MainWindow(QMainWindow):
         group_pre.setLayout(pre_layout)
         right_layout.addWidget(group_pre)
 
-        # ── Morphology / Dilation ──
-        group_morph = QGroupBox("Morphology (Thickness)")
+        group_morph = QGroupBox("Morphology (Gap Bridging)")
         morph_layout = QVBoxLayout()
         
         morph_row = QHBoxLayout()
-        morph_row.addWidget(QLabel("Dilation Amount:"))
-        self.slider_dilation = QSlider(Qt.Horizontal)
-        self.slider_dilation.setRange(0, 10)
-        self.slider_dilation.setValue(0)
-        self.slider_dilation.setTickInterval(1)
-        self.slider_dilation.setTickPosition(QSlider.TicksBelow)
-        self.slider_dilation.valueChanged.connect(self._on_dilation_changed)
-        morph_row.addWidget(self.slider_dilation)
-        self.lbl_dilation_val = QLabel("0")
-        self.lbl_dilation_val.setFixedWidth(30)
-        morph_row.addWidget(self.lbl_dilation_val)
+        morph_row.addWidget(QLabel("Closing Amount:"))
+        self.slider_morph = QSlider(Qt.Horizontal)
+        self.slider_morph.setRange(0, 10)
+        self.slider_morph.setValue(0)
+        self.slider_morph.setTickInterval(1)
+        self.slider_morph.setTickPosition(QSlider.TicksBelow)
+        self.slider_morph.valueChanged.connect(self._on_morph_changed)
+        morph_row.addWidget(self.slider_morph)
+        self.lbl_morph_val = QLabel("0")
+        self.lbl_morph_val.setFixedWidth(30)
+        morph_row.addWidget(self.lbl_morph_val)
         morph_layout.addLayout(morph_row)
         
-        morph_hint = QLabel("Closes gaps in 7-segment numbers. (0 = Disabled, 1-3 = Recommended)")
+        morph_hint = QLabel("Uses 'Closing' to bridge gaps without blooming decimals. (0-3 Recommended)")
         morph_hint.setStyleSheet("color: gray; font-size: 11px;")
         morph_layout.addWidget(morph_hint)
         
         group_morph.setLayout(morph_layout)
         right_layout.addWidget(group_morph)
 
-        # ── Confidence ──
         group_conf = QGroupBox("OCR Confidence Filter")
         conf_layout = QVBoxLayout()
 
-        self.lbl_conf = QLabel("Min Confidence: 0.30")
+        self.lbl_conf = QLabel("Min Confidence: 0.20")
         self.lbl_conf.setStyleSheet("font-weight: bold;")
         conf_layout.addWidget(self.lbl_conf)
 
@@ -415,7 +410,12 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("0.00"))
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setRange(0, 100)
-        self.conf_slider.setValue(30)
+        
+        # ─────────────────────────────────────────────────────────
+        # Changed default slider value to 20 to prevent over-filtering
+        # ─────────────────────────────────────────────────────────
+        self.conf_slider.setValue(20)
+        
         self.conf_slider.setTickInterval(10)
         self.conf_slider.setTickPosition(QSlider.TicksBelow)
         self.conf_slider.valueChanged.connect(self._on_confidence_changed)
@@ -423,14 +423,13 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("1.00"))
         conf_layout.addLayout(conf_row)
 
-        conf_hint = QLabel("Drag left → show more results (lower confidence accepted)")
-        conf_hint.setStyleSheet("color: gray; font-size: 11px;")
+        conf_hint = QLabel("7-segment displays usually score low (0.20 - 0.50). Don't set this too high!")
+        conf_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
         conf_layout.addWidget(conf_hint)
 
         group_conf.setLayout(conf_layout)
         right_layout.addWidget(group_conf)
 
-        # ── Execution Controls ──
         group_actions = QGroupBox("Execution Controls")
         act = QVBoxLayout()
 
@@ -481,8 +480,8 @@ class MainWindow(QMainWindow):
         self.lbl_thresh_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
 
-    def _on_dilation_changed(self, value):
-        self.lbl_dilation_val.setText(str(value))
+    def _on_morph_changed(self, value):
+        self.lbl_morph_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
 
     def _refresh_preview_and_queue_ocr(self):
@@ -493,7 +492,7 @@ class MainWindow(QMainWindow):
             self.selected_roi,
             self.chk_otsu.isChecked(),
             self.slider_thresh.value(),
-            self.slider_dilation.value()
+            self.slider_morph.value()
         )
         self._show_preview(binary)
         self._ocr_debounce.start()
@@ -562,7 +561,7 @@ class MainWindow(QMainWindow):
             {
                 'use_otsu':       self.chk_otsu.isChecked(),
                 'manual_thresh':  self.slider_thresh.value(),
-                'dilation_iters': self.slider_dilation.value(),
+                'morph_iters':    self.slider_morph.value(),
                 'confidence':     self.conf_slider.value() / 100.0,
             }
         )
