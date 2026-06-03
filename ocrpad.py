@@ -27,13 +27,10 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing — Horizontal Stretch + Morphological Closing
+# Shared preprocessing — Smart Gap Splicing & Anti-Aliasing
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morph_iters: int) -> np.ndarray:
-    """
-    Crop → Stretch Width → Grayscale → Blur → Binarize → Morph Close → Pad → Invert.
-    """
     h, w = frame_bgr.shape[:2]
 
     # ── 1. ROI crop ──────────────────────────────────────────────────────────
@@ -48,40 +45,57 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morp
     else:
         region = frame_bgr
 
-    # ── 2. Horizontal Stretch (Zoom) ─────────────────────────────────────────
-    # MAGIC HAPPENS HERE: We stretch the width by 3.5x and height by 2.5x.
-    # This turns a thin, invisible "1" into a thick, obvious character block.
-    region = cv2.resize(region, None, fx=3.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    # ── 2. Uniform Upscale ───────────────────────────────────────────────────
+    region = cv2.resize(region, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
 
-    # ── 3. Grayscale ─────────────────────────────────────────────────────────
+    # ── 3. Grayscale & Blur ──────────────────────────────────────────────────
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-
-    # ── 4. Gaussian Blur ─────────────────────────────────────────────────────
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # ── 5. Binarize ──────────────────────────────────────────────────────────
+    # ── 4. Binarize ──────────────────────────────────────────────────────────
     if use_otsu:
         _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     else:
         _, binary = cv2.threshold(blurred, manual_thresh, 255, cv2.THRESH_BINARY)
 
-    # ── 6. Ensure Dark Text on White Background initially ────────────────────
+    # ── 5. Ensure Dark Text on White Background ──────────────────────────────
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
-    # ── 7. Morphological Closing (Bridge gaps, preserve decimals) ────────────
+    # ── 6. Morphological Closing (Caution: Destroys Decimals if > 1) ─────────
     if morph_iters > 0:
         binary_inverted = cv2.bitwise_not(binary)
-        # We use a 3x3 kernel. MORPH_CLOSE fills in small holes/gaps without 
-        # expanding the outer boundaries of the text like dilation does.
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         closed = cv2.morphologyEx(binary_inverted, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
         binary = cv2.bitwise_not(closed)
 
-    # ── 8. Add Padding ───────────────────────────────────────────────────────
-    padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
+    # ── 7. SMART GAP SPLICING (Removes the giant void after the "1") ─────────
+    # Scans vertically. If it sees more than 20 pixels of pure empty space, 
+    # it deletes the rest of the void, physically pulling the numbers together.
+    col_has_text = np.any(binary < 127, axis=0) # True if column contains part of a number
+    keep_cols = []
+    empty_count = 0
+    
+    for x in range(binary.shape[1]):
+        if col_has_text[x]:
+            empty_count = 0
+            keep_cols.append(x)
+        else:
+            empty_count += 1
+            if empty_count <= 25:  # Allow a maximum gap of 25 pixels between digits
+                keep_cols.append(x)
+                
+    if len(keep_cols) > 0:
+        binary = binary[:, keep_cols]
 
-    return padded
+    # ── 8. Pad & Final Anti-Aliasing ─────────────────────────────────────────
+    padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
+    
+    # Neural Networks prefer smooth edges. This slight blur turns harsh pixel 
+    # steps into soft edges, making the decimal point much easier for AI to spot.
+    final_ready = cv2.GaussianBlur(padded, (3, 3), 0)
+
+    return final_ready
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -136,12 +150,13 @@ class OCRWorker(QThread):
 
             ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
             
+            # Since the giant gap is physically gone, we don't need crazy overrides anymore.
             raw = self.reader.readtext(ocr_input, allowlist='0123456789.')
 
             self._last_raw    = raw
             self._last_binary = binary.copy()
 
-            conf  = self.config.get('confidence', 0.20) # Default internally
+            conf  = self.config.get('confidence', 0.15)
             lines = self._parse_result(raw, conf)
             text  = "\n".join(lines) if lines else "No text detected."
             elapsed_ms = (time.time() - start_time) * 1000
@@ -157,20 +172,31 @@ class OCRWorker(QThread):
             self._busy = False
 
     @staticmethod
-    def _parse_result(result, confidence: float = 0.20) -> list:
+    def _parse_result(result, confidence: float = 0.15) -> list:
         if not result:
             return []
-        lines = []
+        
+        valid_items = []
         for item in result:
             try:
-                # Strip weird spaces, leave numbers and dots
                 text  = str(item[1]).replace(" ", "")
                 score = float(item[2])
+                x_pos = float(item[0][0][0]) 
+                
                 if text and score >= confidence:
-                    lines.append(f"{text}   [{score:.2f}]")
+                    valid_items.append((x_pos, text, score))
             except (IndexError, TypeError, ValueError):
                 continue
-        return lines
+                
+        if not valid_items:
+            return []
+            
+        # Left-to-Right Auto-Glue
+        valid_items.sort(key=lambda x: x[0])
+        combined_text = "".join([i[1] for i in valid_items])
+        avg_score = sum([i[2] for i in valid_items]) / len(valid_items)
+        
+        return [f"{combined_text}   [{avg_score:.2f}]"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,7 +315,7 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — EasyOCR (Horizontal Stretch Fix)")
+        self.setWindowTitle("OCR Pipeline — Smart Gap Splicing")
         self.setGeometry(100, 100, 1260, 920)
 
         self.current_frame   = None
@@ -381,8 +407,8 @@ class MainWindow(QMainWindow):
         morph_row = QHBoxLayout()
         morph_row.addWidget(QLabel("Closing Amount:"))
         self.slider_morph = QSlider(Qt.Horizontal)
-        self.slider_morph.setRange(0, 10)
-        self.slider_morph.setValue(0)
+        self.slider_morph.setRange(0, 5)
+        self.slider_morph.setValue(0) # Default to 0 so decimals live!
         self.slider_morph.setTickInterval(1)
         self.slider_morph.setTickPosition(QSlider.TicksBelow)
         self.slider_morph.valueChanged.connect(self._on_morph_changed)
@@ -392,8 +418,8 @@ class MainWindow(QMainWindow):
         morph_row.addWidget(self.lbl_morph_val)
         morph_layout.addLayout(morph_row)
         
-        morph_hint = QLabel("Uses 'Closing' to bridge gaps without blooming decimals. (0-3 Recommended)")
-        morph_hint.setStyleSheet("color: gray; font-size: 11px;")
+        morph_hint = QLabel("WARNING: Setting this above 1 will melt decimal points!")
+        morph_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
         morph_layout.addWidget(morph_hint)
         
         group_morph.setLayout(morph_layout)
@@ -402,7 +428,7 @@ class MainWindow(QMainWindow):
         group_conf = QGroupBox("OCR Confidence Filter")
         conf_layout = QVBoxLayout()
 
-        self.lbl_conf = QLabel("Min Confidence: 0.20")
+        self.lbl_conf = QLabel("Min Confidence: 0.15")
         self.lbl_conf.setStyleSheet("font-weight: bold;")
         conf_layout.addWidget(self.lbl_conf)
 
@@ -410,12 +436,7 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("0.00"))
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setRange(0, 100)
-        
-        # ─────────────────────────────────────────────────────────
-        # Changed default slider value to 20 to prevent over-filtering
-        # ─────────────────────────────────────────────────────────
-        self.conf_slider.setValue(20)
-        
+        self.conf_slider.setValue(15)
         self.conf_slider.setTickInterval(10)
         self.conf_slider.setTickPosition(QSlider.TicksBelow)
         self.conf_slider.valueChanged.connect(self._on_confidence_changed)
@@ -423,8 +444,8 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("1.00"))
         conf_layout.addLayout(conf_row)
 
-        conf_hint = QLabel("7-segment displays usually score low (0.20 - 0.50). Don't set this too high!")
-        conf_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
+        conf_hint = QLabel("Keep this low (0.15 - 0.25) so it doesn't hide valid output.")
+        conf_hint.setStyleSheet("color: gray; font-size: 11px;")
         conf_layout.addWidget(conf_hint)
 
         group_conf.setLayout(conf_layout)
