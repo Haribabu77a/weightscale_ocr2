@@ -27,10 +27,47 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing — Smart Gap Splicing & Anti-Aliasing
+# Custom Gap Measurement (The "11" Splicer)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morph_iters: int) -> np.ndarray:
+def remove_massive_gaps(binary_img, max_allowed_gap):
+    """
+    Scans the image column by column to MEASURE THE WIDTH of the empty gaps.
+    If a gap is wider than 'max_allowed_gap', it cuts out the excess pixels.
+    This safely pulls isolated numbers together without squishing them into a '4'.
+    """
+    # Invert so text is >0
+    inv = cv2.bitwise_not(binary_img)
+    col_sums = np.sum(inv, axis=0)
+    has_text = col_sums > 0
+    
+    new_cols = []
+    current_gap = 0
+    
+    for x in range(binary_img.shape[1]):
+        if has_text[x]:
+            if current_gap > 0:
+                # Add the empty space back, but CAP IT at max_allowed_gap
+                gap_to_add = min(current_gap, max_allowed_gap)
+                for _ in range(gap_to_add):
+                    new_cols.append(np.full(binary_img.shape[0], 255, dtype=np.uint8))
+            
+            current_gap = 0
+            new_cols.append(binary_img[:, x])
+        else:
+            current_gap += 1
+            
+    if len(new_cols) == 0:
+        return binary_img
+        
+    return np.column_stack(new_cols)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morph_iters: int, gap_limit: int) -> np.ndarray:
     h, w = frame_bgr.shape[:2]
 
     # ── 1. ROI crop ──────────────────────────────────────────────────────────
@@ -62,37 +99,18 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int, morp
     if np.mean(binary) < 127:
         binary = cv2.bitwise_not(binary)
 
-    # ── 6. Morphological Closing (Caution: Destroys Decimals if > 1) ─────────
+    # ── 6. PIXEL GAP SPLICING (Your Logic) ───────────────────────────────────
+    binary = remove_massive_gaps(binary, max_allowed_gap=gap_limit)
+
+    # ── 7. Morphological Closing ─────────────────────────────────────────────
     if morph_iters > 0:
         binary_inverted = cv2.bitwise_not(binary)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         closed = cv2.morphologyEx(binary_inverted, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
         binary = cv2.bitwise_not(closed)
 
-    # ── 7. SMART GAP SPLICING (Removes the giant void after the "1") ─────────
-    # Scans vertically. If it sees more than 20 pixels of pure empty space, 
-    # it deletes the rest of the void, physically pulling the numbers together.
-    col_has_text = np.any(binary < 127, axis=0) # True if column contains part of a number
-    keep_cols = []
-    empty_count = 0
-    
-    for x in range(binary.shape[1]):
-        if col_has_text[x]:
-            empty_count = 0
-            keep_cols.append(x)
-        else:
-            empty_count += 1
-            if empty_count <= 25:  # Allow a maximum gap of 25 pixels between digits
-                keep_cols.append(x)
-                
-    if len(keep_cols) > 0:
-        binary = binary[:, keep_cols]
-
     # ── 8. Pad & Final Anti-Aliasing ─────────────────────────────────────────
     padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
-    
-    # Neural Networks prefer smooth edges. This slight blur turns harsh pixel 
-    # steps into soft edges, making the decimal point much easier for AI to spot.
     final_ready = cv2.GaussianBlur(padded, (3, 3), 0)
 
     return final_ready
@@ -145,13 +163,19 @@ class OCRWorker(QThread):
                 self.roi,
                 self.config.get('use_otsu', True),
                 self.config.get('manual_thresh', 127),
-                self.config.get('morph_iters', 0)
+                self.config.get('morph_iters', 0),
+                self.config.get('gap_limit', 50)
             )
 
             ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
             
-            # Since the giant gap is physically gone, we don't need crazy overrides anymore.
-            raw = self.reader.readtext(ocr_input, allowlist='0123456789.')
+            raw = self.reader.readtext(
+                ocr_input, 
+                allowlist='0123456789.', 
+                width_ths=2.0,       
+                text_threshold=0.1,  
+                low_text=0.1         
+            )
 
             self._last_raw    = raw
             self._last_binary = binary.copy()
@@ -191,11 +215,14 @@ class OCRWorker(QThread):
         if not valid_items:
             return []
             
-        # Left-to-Right Auto-Glue
         valid_items.sort(key=lambda x: x[0])
         combined_text = "".join([i[1] for i in valid_items])
-        avg_score = sum([i[2] for i in valid_items]) / len(valid_items)
         
+        if len(valid_items) > 0:
+            avg_score = sum([i[2] for i in valid_items]) / len(valid_items)
+        else:
+            avg_score = 0.0
+            
         return [f"{combined_text}   [{avg_score:.2f}]"]
 
 
@@ -315,8 +342,8 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — Smart Gap Splicing")
-        self.setGeometry(100, 100, 1260, 920)
+        self.setWindowTitle("OCR Pipeline — Custom Gap Splicing")
+        self.setGeometry(100, 100, 1260, 950)
 
         self.current_frame   = None
         self.selected_roi    = None
@@ -377,6 +404,7 @@ class MainWindow(QMainWindow):
         group_media.setLayout(mf)
         right_layout.addWidget(group_media)
 
+        # Binarization
         group_pre = QGroupBox("Binarization")
         pre_layout = QVBoxLayout()
 
@@ -401,14 +429,40 @@ class MainWindow(QMainWindow):
         group_pre.setLayout(pre_layout)
         right_layout.addWidget(group_pre)
 
-        group_morph = QGroupBox("Morphology (Gap Bridging)")
+        # The "11" Fix Splicer Box
+        group_splicer = QGroupBox("Gap Splicing (The '11' Fix)")
+        splicer_layout = QVBoxLayout()
+        
+        gap_row = QHBoxLayout()
+        gap_row.addWidget(QLabel("Max Gap Limit:"))
+        self.slider_gap = QSlider(Qt.Horizontal)
+        self.slider_gap.setRange(10, 100)
+        self.slider_gap.setValue(50)  # Safe default to prevent 11s from squishing
+        self.slider_gap.setTickInterval(10)
+        self.slider_gap.setTickPosition(QSlider.TicksBelow)
+        self.slider_gap.valueChanged.connect(self._on_gap_changed)
+        gap_row.addWidget(self.slider_gap)
+        self.lbl_gap_val = QLabel("50")
+        self.lbl_gap_val.setFixedWidth(30)
+        gap_row.addWidget(self.lbl_gap_val)
+        splicer_layout.addLayout(gap_row)
+        
+        gap_hint = QLabel("If '1' vanishes: LOWER limit. If '11' becomes '4': INCREASE limit.")
+        gap_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
+        splicer_layout.addWidget(gap_hint)
+        
+        group_splicer.setLayout(splicer_layout)
+        right_layout.addWidget(group_splicer)
+
+        # Morphology
+        group_morph = QGroupBox("Morphology (Optional)")
         morph_layout = QVBoxLayout()
         
         morph_row = QHBoxLayout()
         morph_row.addWidget(QLabel("Closing Amount:"))
         self.slider_morph = QSlider(Qt.Horizontal)
         self.slider_morph.setRange(0, 5)
-        self.slider_morph.setValue(0) # Default to 0 so decimals live!
+        self.slider_morph.setValue(0)
         self.slider_morph.setTickInterval(1)
         self.slider_morph.setTickPosition(QSlider.TicksBelow)
         self.slider_morph.valueChanged.connect(self._on_morph_changed)
@@ -418,13 +472,10 @@ class MainWindow(QMainWindow):
         morph_row.addWidget(self.lbl_morph_val)
         morph_layout.addLayout(morph_row)
         
-        morph_hint = QLabel("WARNING: Setting this above 1 will melt decimal points!")
-        morph_hint.setStyleSheet("color: #cc0000; font-size: 11px; font-weight: bold;")
-        morph_layout.addWidget(morph_hint)
-        
         group_morph.setLayout(morph_layout)
         right_layout.addWidget(group_morph)
 
+        # Confidence Filter
         group_conf = QGroupBox("OCR Confidence Filter")
         conf_layout = QVBoxLayout()
 
@@ -444,13 +495,10 @@ class MainWindow(QMainWindow):
         conf_row.addWidget(QLabel("1.00"))
         conf_layout.addLayout(conf_row)
 
-        conf_hint = QLabel("Keep this low (0.15 - 0.25) so it doesn't hide valid output.")
-        conf_hint.setStyleSheet("color: gray; font-size: 11px;")
-        conf_layout.addWidget(conf_hint)
-
         group_conf.setLayout(conf_layout)
         right_layout.addWidget(group_conf)
 
+        # Execution Controls
         group_actions = QGroupBox("Execution Controls")
         act = QVBoxLayout()
 
@@ -504,6 +552,10 @@ class MainWindow(QMainWindow):
     def _on_morph_changed(self, value):
         self.lbl_morph_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
+        
+    def _on_gap_changed(self, value):
+        self.lbl_gap_val.setText(str(value))
+        self._refresh_preview_and_queue_ocr()
 
     def _refresh_preview_and_queue_ocr(self):
         if self.current_frame is None:
@@ -513,7 +565,8 @@ class MainWindow(QMainWindow):
             self.selected_roi,
             self.chk_otsu.isChecked(),
             self.slider_thresh.value(),
-            self.slider_morph.value()
+            self.slider_morph.value(),
+            self.slider_gap.value()
         )
         self._show_preview(binary)
         self._ocr_debounce.start()
@@ -583,6 +636,7 @@ class MainWindow(QMainWindow):
                 'use_otsu':       self.chk_otsu.isChecked(),
                 'manual_thresh':  self.slider_thresh.value(),
                 'morph_iters':    self.slider_morph.value(),
+                'gap_limit':      self.slider_gap.value(),
                 'confidence':     self.conf_slider.value() / 100.0,
             }
         )
