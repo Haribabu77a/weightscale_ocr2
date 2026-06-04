@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QVBoxLayout, QHBoxLayout, QFileDialog, QComboBox, QSlider,
     QTextEdit, QGroupBox, QFormLayout, QScrollArea, QCheckBox,
-    QMessageBox
+    QMessageBox, QSpinBox
 )
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen
 
@@ -61,11 +61,11 @@ def remove_massive_gaps(binary_img, max_allowed_gap):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared preprocessing — WITH DECIMAL PROTECTION
+# Shared preprocessing — (Biased Otsu -> Area Filter -> Closing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int,
-                   morph_iters: int, gap_limit: int, do_splice: bool = True) -> np.ndarray:
+def compute_binary(frame_bgr, roi_rect, use_otsu: bool, otsu_offset: int, manual_thresh: int,
+                   area_threshold: int, morph_iters: int, gap_limit: int, do_splice: bool = True) -> np.ndarray:
     h, w = frame_bgr.shape[:2]
 
     # ── 1. ROI crop ──────────────────────────────────────────────────────────
@@ -87,9 +87,14 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int,
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # ── 4. Binarize ──────────────────────────────────────────────────────────
+    # ── 4. Binarize (Biased Otsu Implementation) ─────────────────────────────
     if use_otsu:
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Step 1: Let Otsu calculate the mathematical ideal threshold
+        otsu_val, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Step 2: Apply the user's bias offset (e.g. +5) and clamp between 0-255
+        final_thresh = max(0, min(255, int(otsu_val) + otsu_offset))
+        # Step 3: Run the actual binarization with our biased value
+        _, binary = cv2.threshold(blurred, final_thresh, 255, cv2.THRESH_BINARY)
     else:
         _, binary = cv2.threshold(blurred, manual_thresh, 255, cv2.THRESH_BINARY)
 
@@ -101,41 +106,28 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int,
     if do_splice:
         binary = remove_massive_gaps(binary, max_allowed_gap=gap_limit)
 
-    # ── 7. DECIMAL-PROTECTED MORPHOLOGY ──────────────────────────────────────
-    if morph_iters > 0:
+    # ── 7. AREA FILTER (Surgically deletes small dots FIRST) ─────────────────
+    if area_threshold > 0:
         binary_inverted = cv2.bitwise_not(binary)
         
-        # A. Find all connected shapes on the screen
         num, labels, stats, _ = cv2.connectedComponentsWithStats(binary_inverted, connectivity=8)
-        
-        digits_mask = np.zeros_like(binary_inverted)
-        dots_mask = np.zeros_like(binary_inverted)
-        
-        H_img = binary_inverted.shape[0]
-        # Find the height of the tallest thing on screen (usually a number)
-        max_h = max([stats[i, cv2.CC_STAT_HEIGHT] for i in range(1, num)] + [1])
+        clean_mask = np.zeros_like(binary_inverted)
         
         for i in range(1, num):
-            y = int(stats[i, cv2.CC_STAT_TOP])
-            hh = int(stats[i, cv2.CC_STAT_HEIGHT])
-            aa = int(stats[i, cv2.CC_STAT_AREA])
-            
-            # B. Isolate the Decimal Point
-            # If the shape is tiny (< 35% height) and sits in the bottom half of the image...
-            if hh <= 0.35 * max_h and aa >= 4 and (y + hh) > 0.55 * H_img:
-                dots_mask[labels == i] = 255  # Save it to the protected dots layer
-            else:
-                digits_mask[labels == i] = 255 # Keep it in the numbers layer
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= area_threshold:
+                clean_mask[labels == i] = 255
                 
-        # C. Run aggressive Closing ONLY on the big numbers
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        closed_digits = cv2.morphologyEx(digits_mask, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
-        
-        # D. Combine the closed numbers with the perfectly protected decimal point
-        recombined = cv2.bitwise_or(closed_digits, dots_mask)
-        binary = cv2.bitwise_not(recombined)
+        binary = cv2.bitwise_not(clean_mask)
 
-    # ── 8. Pad & Final Anti-Aliasing ─────────────────────────────────────────
+    # ── 8. MORPHOLOGICAL CLOSING (Heals broken LCD segments SECOND) ──────────
+    if morph_iters > 0:
+        binary_inverted = cv2.bitwise_not(binary)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        closed_digits = cv2.morphologyEx(binary_inverted, cv2.MORPH_CLOSE, kernel, iterations=morph_iters)
+        binary = cv2.bitwise_not(closed_digits)
+
+    # ── 9. Pad & Final Anti-Aliasing ─────────────────────────────────────────
     padded = cv2.copyMakeBorder(binary, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=255)
     final_ready = cv2.GaussianBlur(padded, (3, 3), 0)
 
@@ -148,16 +140,14 @@ def compute_binary(frame_bgr, roi_rect, use_otsu: bool, manual_thresh: int,
 
 def segment_digits(binary,
                    min_h_frac: float = 0.40,
-                   dot_h_range=(0.05, 0.35),
-                   split_ratio: float = 1.5,
-                   min_dot_area: int = 6):
+                   split_ratio: float = 1.5):
     
     text = cv2.bitwise_not(binary)                      
     _, text = cv2.threshold(text, 127, 255, cv2.THRESH_BINARY)
 
     num, _labels, stats, _cent = cv2.connectedComponentsWithStats(text, connectivity=8)
     if num <= 1:
-        return [], []
+        return []
 
     raw = []
     for i in range(1, num):
@@ -165,24 +155,20 @@ def segment_digits(binary,
         y = int(stats[i, cv2.CC_STAT_TOP])
         ww = int(stats[i, cv2.CC_STAT_WIDTH])
         hh = int(stats[i, cv2.CC_STAT_HEIGHT])
-        aa = int(stats[i, cv2.CC_STAT_AREA])
-        raw.append((x, y, ww, hh, aa))
+        raw.append((x, y, ww, hh))
+
+    if not raw:
+        return []
 
     max_h = max(c[3] for c in raw)
-    H = binary.shape[0]
 
-    digits, dots = [], []
-    for (x, y, ww, hh, aa) in raw:
+    digits = []
+    for (x, y, ww, hh) in raw:
         if hh >= min_h_frac * max_h:
             digits.append([x, y, ww, hh])
-        elif (dot_h_range[0] * max_h <= hh <= dot_h_range[1] * max_h
-              and aa >= min_dot_area and (y + hh) > 0.55 * H):
-            dots.append([x, y, ww, hh])
-
-    dot_boxes = [[x, x + ww, y, y + hh] for (x, y, ww, hh) in dots]
 
     if not digits:
-        return [], dot_boxes
+        return []
 
     digits.sort(key=lambda c: c[0])
 
@@ -213,7 +199,7 @@ def segment_digits(binary,
             split.append([x, y, ww, hh])
 
     digit_boxes = [[x, x + ww, y, y + hh] for (x, y, ww, hh) in split]
-    return digit_boxes, dot_boxes
+    return digit_boxes
 
 
 def _gap_cuts(text_mask, min_sub: int, gap_frac: float = 0.06):
@@ -241,12 +227,10 @@ def _gap_cuts(text_mask, min_sub: int, gap_frac: float = 0.06):
     return cuts
 
 
-def annotate_segmentation(binary, digit_boxes, dot_boxes):
+def annotate_segmentation(binary, digit_boxes):
     vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
     for (x0, x1, y0, y1) in digit_boxes:
         cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 170, 0), 2)
-    for (x0, x1, y0, y1) in dot_boxes:
-        cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 0, 220), 2)
     return vis
 
 
@@ -324,7 +308,9 @@ class OCRWorker(QThread):
 
         if self._last_raw is None or self._last_binary is None:
             return
-        lines = self._parse_result(self._last_raw, confidence)
+        
+        dec_pos = self.config.get('dec_pos', 0)
+        lines = self._parse_result(self._last_raw, confidence, dec_pos)
         text  = "\n".join(lines) if lines else "No text detected."
         self.result_ready.emit(text, 0.0, self._last_binary.copy())
 
@@ -338,7 +324,6 @@ class OCRWorker(QThread):
                 self._run_per_digit()
             else:
                 self._run_legacy()
-            _ = start_time
         except Exception:
             tb = traceback.format_exc()
             print("OCR Worker Error:\n", tb)
@@ -354,7 +339,9 @@ class OCRWorker(QThread):
         binary = compute_binary(
             self.frame, self.roi,
             self.config.get('use_otsu', True),
+            self.config.get('otsu_offset', 5),
             self.config.get('manual_thresh', 127),
+            self.config.get('area_threshold', 0),
             self.config.get('morph_iters', 0),
             self.config.get('gap_limit', 50),
             do_splice=False,
@@ -362,10 +349,10 @@ class OCRWorker(QThread):
         H, W = binary.shape
         pad = self.config.get('pad_pct', 30) / 100.0
 
-        digit_boxes, dot_boxes = segment_digits(binary)
+        digit_boxes = segment_digits(binary)
         padded = pad_digit_boxes(digit_boxes, W, H, pad_x=pad, pad_y=pad)
 
-        vis = annotate_segmentation(binary, padded, dot_boxes)
+        vis = annotate_segmentation(binary, padded)
         self._last_mode   = 'perdigit'
         self._last_binary = binary.copy()
         self._last_vis    = vis.copy()
@@ -389,12 +376,12 @@ class OCRWorker(QThread):
             confs.append(conf)
             tokens.append(((box[0] + box[1]) / 2.0, ch))
 
-        dot_x = self._select_decimal(dot_boxes, digit_boxes)
-        if dot_x is not None:
-            tokens.append((dot_x, '.'))
-
         tokens.sort(key=lambda t: t[0])
-        number = self._finalize_number(tokens)
+        raw_number_str = ''.join(ch for _, ch in tokens)
+        
+        # Manually inject the decimal point based on UI setting
+        dec_pos = self.config.get('dec_pos', 0)
+        number = self._inject_decimal(raw_number_str, dec_pos)
 
         mean_conf = (sum(confs) / len(confs)) if confs else 0.0
         low = empties > 0 or (confs and min(confs) < 0.30)
@@ -423,28 +410,16 @@ class OCRWorker(QThread):
         return best_txt, best_conf
 
     @staticmethod
-    def _select_decimal(dot_boxes, digit_boxes):
-        if not dot_boxes or not digit_boxes:
-            return None
-        first_x = min(b[0] for b in digit_boxes)
-        last_x  = max(b[1] for b in digit_boxes)
-        best_x, best_area = None, -1
-        for (x0, x1, y0, y1) in dot_boxes:
-            cx = (x0 + x1) / 2.0
-            if first_x < cx < last_x:
-                area = (x1 - x0) * (y1 - y0)
-                if area > best_area:
-                    best_x, best_area = cx, area
-        return best_x
-
-    @staticmethod
-    def _finalize_number(tokens):
-        s = ''.join(ch for _, ch in tokens)
-        s = re.sub(r'[^0-9.]', '', s)
-        if s.count('.') > 1:
-            i = s.index('.')
-            s = s[:i + 1] + s[i + 1:].replace('.', '')
-        return s
+    def _inject_decimal(num_str: str, dec_pos: int) -> str:
+        s = re.sub(r'[^0-9]', '', num_str) # Strip to pure digits
+        if not s or dec_pos == 0:
+            return s
+        
+        # Pad with leading zeros if the number is too short (e.g., '5' -> '0.05')
+        if len(s) <= dec_pos:
+            s = s.zfill(dec_pos + 1)
+            
+        return s[:-dec_pos] + '.' + s[-dec_pos:]
 
     # ── Legacy CRAFT pipeline ───────────────────────
     def _run_legacy(self):
@@ -453,7 +428,9 @@ class OCRWorker(QThread):
         binary = compute_binary(
             self.frame, self.roi,
             self.config.get('use_otsu', True),
+            self.config.get('otsu_offset', 5),
             self.config.get('manual_thresh', 127),
+            self.config.get('area_threshold', 0),
             self.config.get('morph_iters', 0),
             self.config.get('gap_limit', 50),
             do_splice=True,
@@ -462,7 +439,7 @@ class OCRWorker(QThread):
         ocr_input = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         raw = self.reader.readtext(
             ocr_input,
-            allowlist='0123456789.',
+            allowlist='0123456789', # Removed decimal from allowlist
             width_ths=0.0,
             link_threshold=0.9,
             mag_ratio=1.5,
@@ -477,13 +454,14 @@ class OCRWorker(QThread):
         self._last_binary = binary.copy()
 
         conf  = self.config.get('confidence', 0.15)
-        lines = self._parse_result(raw, conf)
+        dec_pos = self.config.get('dec_pos', 0)
+        lines = self._parse_result(raw, conf, dec_pos)
+        
         text  = "\n".join(lines) if lines else "No text detected."
         elapsed_ms = (time.time() - start_time) * 1000.0
         self.result_ready.emit(text, elapsed_ms, binary.copy())
 
-    @staticmethod
-    def _parse_result(result, confidence: float = 0.15) -> list:
+    def _parse_result(self, result, confidence: float, dec_pos: int) -> list:
         if not result:
             return []
 
@@ -524,14 +502,16 @@ class OCRWorker(QThread):
                 current_scores.append(item['score'])
             else:
                 avg_score = sum(current_scores) / len(current_scores)
-                grouped_results.append(f"{current_text}   [{avg_score:.2f}]")
+                formatted_text = self._inject_decimal(current_text, dec_pos)
+                grouped_results.append(f"{formatted_text}   [{avg_score:.2f}]")
                 current_text = item['text']
                 current_scores = [item['score']]
 
             last_x_max = item['x_max']
 
         avg_score = sum(current_scores) / len(current_scores)
-        grouped_results.append(f"{current_text}   [{avg_score:.2f}]")
+        formatted_text = self._inject_decimal(current_text, dec_pos)
+        grouped_results.append(f"{formatted_text}   [{avg_score:.2f}]")
 
         return grouped_results
 
@@ -652,7 +632,7 @@ class VideoLabel(QLabel):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OCR Pipeline — Decimal Protection Edition")
+        self.setWindowTitle("OCR Pipeline — Biased Otsu & Iteration Healing")
         self.setGeometry(100, 100, 1260, 980)
 
         self.current_frame   = None
@@ -747,14 +727,45 @@ class MainWindow(QMainWindow):
         group_mode.setLayout(mode_layout)
         right_layout.addWidget(group_mode)
 
+        # Manual Decimal Placement
+        group_decimal = QGroupBox("Manual Decimal Placement")
+        dec_layout = QHBoxLayout()
+        dec_layout.addWidget(QLabel("Decimal Pos (from right):"))
+        self.spin_dec = QSpinBox()
+        self.spin_dec.setRange(0, 5)
+        self.spin_dec.setValue(0)
+        self.spin_dec.valueChanged.connect(self._refresh_preview_and_queue_ocr)
+        dec_layout.addWidget(self.spin_dec)
+        
+        dec_hint = QLabel("0 = No decimal (1234)\n1 = One place (123.4)")
+        dec_hint.setStyleSheet("color: gray; font-size: 11px;")
+        dec_layout.addWidget(dec_hint)
+        
+        group_decimal.setLayout(dec_layout)
+        right_layout.addWidget(group_decimal)
+
         # Binarization
-        group_pre = QGroupBox("Binarization")
+        group_pre = QGroupBox("Binarization (Now with Biased Otsu!)")
         pre_layout = QVBoxLayout()
 
-        self.chk_otsu = QCheckBox("Auto Otsu (recommended)")
+        otsu_row = QHBoxLayout()
+        self.chk_otsu = QCheckBox("Auto Otsu Baseline")
         self.chk_otsu.setChecked(True)
         self.chk_otsu.stateChanged.connect(self._on_otsu_toggled)
-        pre_layout.addWidget(self.chk_otsu)
+        otsu_row.addWidget(self.chk_otsu)
+        
+        otsu_row.addWidget(QLabel("Offset:"))
+        self.spin_otsu_offset = QSpinBox()
+        self.spin_otsu_offset.setRange(-50, 50)
+        self.spin_otsu_offset.setValue(5) # The +5 you requested!
+        self.spin_otsu_offset.valueChanged.connect(self._refresh_preview_and_queue_ocr)
+        otsu_row.addWidget(self.spin_otsu_offset)
+        otsu_row.addStretch()
+        pre_layout.addLayout(otsu_row)
+        
+        otsu_hint = QLabel("Otsu calculates the ideal math, the Offset bumps it up (+5) to capture glared LCD segments.")
+        otsu_hint.setStyleSheet("color: #0055cc; font-size: 11px;")
+        pre_layout.addWidget(otsu_hint)
 
         thresh_row = QHBoxLayout()
         thresh_row.addWidget(QLabel("Manual Threshold:"))
@@ -772,55 +783,50 @@ class MainWindow(QMainWindow):
         group_pre.setLayout(pre_layout)
         right_layout.addWidget(group_pre)
 
-        # Gap Splicer (legacy path only)
-        group_splicer = QGroupBox("Gap Splicing (legacy CRAFT path only)")
-        splicer_layout = QVBoxLayout()
+        # Morphology & Area Filter
+        group_filters = QGroupBox("Morphology & Noise Filter")
+        filter_layout = QVBoxLayout()
 
-        gap_row = QHBoxLayout()
-        gap_row.addWidget(QLabel("Max Gap Limit:"))
-        self.slider_gap = QSlider(Qt.Horizontal)
-        self.slider_gap.setRange(10, 100)
-        self.slider_gap.setValue(50)
-        self.slider_gap.setTickInterval(10)
-        self.slider_gap.setTickPosition(QSlider.TicksBelow)
-        self.slider_gap.valueChanged.connect(self._on_gap_changed)
-        gap_row.addWidget(self.slider_gap)
-        self.lbl_gap_val = QLabel("50")
-        self.lbl_gap_val.setFixedWidth(30)
-        gap_row.addWidget(self.lbl_gap_val)
-        splicer_layout.addLayout(gap_row)
+        # Area Filter Slider
+        area_row = QHBoxLayout()
+        area_row.addWidget(QLabel("1. Min Area (Kill dots):"))
+        self.slider_area = QSlider(Qt.Horizontal)
+        self.slider_area.setRange(0, 200)
+        self.slider_area.setValue(80)
+        self.slider_area.setTickInterval(20)
+        self.slider_area.setTickPosition(QSlider.TicksBelow)
+        self.slider_area.valueChanged.connect(self._on_area_changed)
+        area_row.addWidget(self.slider_area)
+        self.lbl_area_val = QLabel("80")
+        self.lbl_area_val.setFixedWidth(30)
+        area_row.addWidget(self.lbl_area_val)
+        filter_layout.addLayout(area_row)
+        
+        area_hint = QLabel("Deletes isolated dots FIRST before they get glued to numbers.")
+        area_hint.setStyleSheet("color: gray; font-size: 11px;")
+        filter_layout.addWidget(area_hint)
 
-        gap_hint = QLabel("Ignored in Per-Digit mode. It only affects the legacy path.")
-        gap_hint.setStyleSheet("color: gray; font-size: 11px;")
-        splicer_layout.addWidget(gap_hint)
-
-        group_splicer.setLayout(splicer_layout)
-        right_layout.addWidget(group_splicer)
-
-        # Morphology
-        group_morph = QGroupBox("Morphology (Now with Decimal Protection!)")
-        morph_layout = QVBoxLayout()
-
+        # Closing Slider (REVERTED TO ITERATIONS)
         morph_row = QHBoxLayout()
-        morph_row.addWidget(QLabel("Closing Amount:"))
+        morph_row.addWidget(QLabel("2. Closing (Heal gaps):"))
         self.slider_morph = QSlider(Qt.Horizontal)
         self.slider_morph.setRange(0, 5)
-        self.slider_morph.setValue(0)
+        self.slider_morph.setValue(1)
         self.slider_morph.setTickInterval(1)
         self.slider_morph.setTickPosition(QSlider.TicksBelow)
         self.slider_morph.valueChanged.connect(self._on_morph_changed)
         morph_row.addWidget(self.slider_morph)
-        self.lbl_morph_val = QLabel("0")
+        self.lbl_morph_val = QLabel("1")
         self.lbl_morph_val.setFixedWidth(30)
         morph_row.addWidget(self.lbl_morph_val)
-        morph_layout.addLayout(morph_row)
+        filter_layout.addLayout(morph_row)
         
-        morph_hint = QLabel("Safe to increase. Decimal points are now mathematically protected from melting.")
-        morph_hint.setStyleSheet("color: #008800; font-size: 11px; font-weight: bold;")
-        morph_layout.addWidget(morph_hint)
+        morph_hint = QLabel("Number of times to run the healing brush to melt broken segments back together.")
+        morph_hint.setStyleSheet("color: gray; font-size: 11px;")
+        filter_layout.addWidget(morph_hint)
 
-        group_morph.setLayout(morph_layout)
-        right_layout.addWidget(group_morph)
+        group_filters.setLayout(filter_layout)
+        right_layout.addWidget(group_filters)
 
         # Confidence Filter
         group_conf = QGroupBox("OCR Confidence Filter (legacy path)")
@@ -894,6 +900,7 @@ class MainWindow(QMainWindow):
 
     def _on_otsu_toggled(self, state):
         self.slider_thresh.setEnabled(not bool(state))
+        self.spin_otsu_offset.setEnabled(bool(state))
         self._refresh_preview_and_queue_ocr()
 
     def _on_thresh_changed(self, value):
@@ -902,6 +909,10 @@ class MainWindow(QMainWindow):
 
     def _on_morph_changed(self, value):
         self.lbl_morph_val.setText(str(value))
+        self._refresh_preview_and_queue_ocr()
+
+    def _on_area_changed(self, value):
+        self.lbl_area_val.setText(str(value))
         self._refresh_preview_and_queue_ocr()
 
     def _on_gap_changed(self, value):
@@ -920,17 +931,19 @@ class MainWindow(QMainWindow):
             self.current_frame,
             self.selected_roi,
             self.chk_otsu.isChecked(),
+            self.spin_otsu_offset.value(),
             self.slider_thresh.value(),
+            self.slider_area.value(),
             self.slider_morph.value(),
-            self.slider_gap.value(),
+            0, # gap limit passed as 0 since we removed the slider for it to make room
             do_splice=not per_digit,
         )
         if per_digit:
-            dboxes, dotboxes = segment_digits(binary)
+            dboxes = segment_digits(binary)
             ph, pw = binary.shape
             p = self.slider_pad.value() / 100.0
             pboxes = pad_digit_boxes(dboxes, pw, ph, pad_x=p, pad_y=p)
-            self._show_preview(annotate_segmentation(binary, pboxes, dotboxes))
+            self._show_preview(annotate_segmentation(binary, pboxes))
         else:
             self._show_preview(binary)
         self._ocr_debounce.start()
@@ -1000,10 +1013,13 @@ class MainWindow(QMainWindow):
                 'per_digit':      self.chk_perdigit.isChecked(),
                 'pad_pct':        self.slider_pad.value(),
                 'use_otsu':       self.chk_otsu.isChecked(),
+                'otsu_offset':    self.spin_otsu_offset.value(),
                 'manual_thresh':  self.slider_thresh.value(),
+                'area_threshold': self.slider_area.value(),
                 'morph_iters':    self.slider_morph.value(),
-                'gap_limit':      self.slider_gap.value(),
+                'gap_limit':      50, # hardcoded fallback for legacy
                 'confidence':     self.conf_slider.value() / 100.0,
+                'dec_pos':        self.spin_dec.value(),
             }
         )
 
